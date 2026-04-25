@@ -1,0 +1,72 @@
+<svg width="1200" height="630" viewBox="0 0 1200 630" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1200" height="630" rx="44" fill="url(#bg)"/>
+  <g opacity="0.48">
+    <circle cx="1022" cy="122" r="190" fill="url(#glowA)"/>
+    <circle cx="240" cy="560" r="200" fill="url(#glowB)"/>
+  </g>
+  <rect x="40" y="40" width="1120" height="550" rx="36" fill="rgba(7,10,24,0.84)" stroke="rgba(255,255,255,0.08)"/>
+  <rect x="88" y="88" width="132" height="132" rx="34" fill="url(#logoTile)"/>
+  <circle cx="182" cy="154" r="42" fill="url(#disc)"/>
+  <circle cx="182" cy="154" r="9" fill="#F8FAFC" fill-opacity="0.92"/>
+  <circle cx="182" cy="154" r="4" fill="#0F172A" fill-opacity="0.88"/>
+  <path d="M120 132C120 126.477 124.477 122 130 122H165C170.523 122 175 126.477 175 132V207C175 212.523 170.523 217 165 217H130C124.477 217 120 212.523 120 207V132Z" fill="#EEF2FF" fill-opacity="0.96"/>
+  <path d="M136 148C136 143.582 139.582 140 144 140H152V189C152 196.732 145.732 203 138 203C130.268 203 124 196.732 124 189C124 181.268 130.268 175 138 175C140.919 175 143.628 175.893 145.869 177.421V156H164V165H145.869V148H136Z" fill="#5B21B6"/>
+  <path d="M254 136H584" stroke="rgba(255,255,255,0.08)" stroke-width="2" stroke-linecap="round"/>
+  <text x="254" y="168" fill="#F8FAFC" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="64" font-weight="700">AudioMerge Pro</text>
+  <text x="254" y="220" fill="#A5B4FC" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="26" font-weight="500">Browser audio editor for trimming, fades, waveform editing, and fast exports.</text>
+  <g>
+    <rect x="88" y="286" width="1024" height="82" rx="24" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.06)"/>
+    <rect x="88" y="388" width="1024" height="82" rx="24" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.06)"/>
+    <rect x="88" y="490" width="1024" height="82" rx="24" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.06)"/>
+    <rect x="148" y="308" width="730" height="38" rx="12" fill="url(#laneA)"/>
+    <rect x="198" y="410" width="594" height="38" rx="12" fill="url(#laneB)"/>
+    <rect x="120" y="512" width="814" height="38" rx="12" fill="url(#laneC)"/>
+    <path d="M190 327C250 300 314 300 374 327C434 354 498 354 558 327C618 300 682 300 742 327C802 354 866 354 926 327" stroke="#E9D5FF" stroke-width="8" stroke-linecap="round"/>
+    <path d="M240 429C286 405 332 405 378 429C424 453 470 453 516 429C562 405 608 405 654 429C700 453 746 453 792 429" stroke="#BFDBFE" stroke-width="8" stroke-linecap="round"/>
+    <path d="M162 531C223 504 284 504 345 531C406 558 467 558 528 531C589 504 650 504 711 531C772 558 833 558 894 531" stroke="#99F6E4" stroke-width="8" stroke-linecap="round"/>
+    <path d="M728 286V572" stroke="#F8FAFC" stroke-opacity="0.9" stroke-width="4"/>
+    <circle cx="728" cy="286" r="10" fill="#F8FAFC"/>
+  </g>
+  <text x="88" y="251" fill="#64748B" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="18" font-weight="600" letter-spacing="0.24em">TRIM  FADE  WAVEFORM  EXPORT</text>
+  <defs>
+    <linearGradient id="bg" x1="98" y1="36" x2="1020" y2="616" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0A1022"/>
+      <stop offset="0.58" stop-color="#070C19"/>
+      <stop offset="1" stop-color="#130B33"/>
+    </linearGradient>
+    <linearGradient id="logoTile" x1="104" y1="100" x2="208" y2="214" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6D4AFF"/>
+      <stop offset="1" stop-color="#4F2AE8"/>
+    </linearGradient>
+    <radialGradient id="disc" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(182 154) rotate(90) scale(42)">
+      <stop offset="0.12" stop-color="#475569"/>
+      <stop offset="0.14" stop-color="#0F172A"/>
+      <stop offset="0.22" stop-color="#334155"/>
+      <stop offset="0.24" stop-color="#020617"/>
+      <stop offset="0.52" stop-color="#0F172A"/>
+      <stop offset="0.54" stop-color="#334155"/>
+      <stop offset="0.57" stop-color="#020617"/>
+      <stop offset="1" stop-color="#020617"/>
+    </radialGradient>
+    <radialGradient id="glowA" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(1022 122) rotate(90) scale(190)">
+      <stop stop-color="#8B5CF6" stop-opacity="0.34"/>
+      <stop offset="1" stop-color="#8B5CF6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowB" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(240 560) rotate(90) scale(200)">
+      <stop stop-color="#22D3EE" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#22D3EE" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="laneA" x1="148" y1="327" x2="878" y2="327" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8B5CF6" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#8B5CF6" stop-opacity="0.3"/>
+    </linearGradient>
+    <linearGradient id="laneB" x1="198" y1="429" x2="792" y2="429" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3B82F6" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#3B82F6" stop-opacity="0.3"/>
+    </linearGradient>
+    <linearGradient id="laneC" x1="120" y1="531" x2="934" y2="531" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#14B8A6" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#14B8A6" stop-opacity="0.3"/>
+    </linearGradient>
+  </defs>
+</svg>

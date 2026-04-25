@@ -10,6 +10,7 @@
   "dependencies": {
     "lamejs": "^1.2.1",
     "lucide-react": "^0.294.0",
+    "music-metadata-browser": "^2.5.11",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },

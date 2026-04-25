@@ -1,55 +1,118 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Upload, Play, Pause, Scissors, Trash2, Sliders, Download, MoveUp, MoveDown, Music, Loader2, Info, Copy, Layers, List } from 'lucide-react';
-import lamejsSource from 'lamejs/lame.all.js?raw';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ChevronDown,
+  Download,
+  Info,
+  Layers,
+  List,
+  Loader2,
+  Music,
+  Play,
+  Scissors,
+  Upload,
+} from 'lucide-react';
 
-const lamejs = new Function(`${lamejsSource}; return lamejs;`)();
+import TrackCard from './TrackCard';
+import {
+  applyGainEnvelope,
+  buildWaveformPeaks,
+  bufferToWav,
+  getAudioContext,
+  getSafeTrackSegment,
+  getTrackFadeDurations,
+  normalizeTrackFades,
+} from '../utils/audioUtils';
+import { createMp3BlobInWorker } from '../utils/mp3Encoder';
+import { extractTrackMetadata, preloadTrackMetadataParser } from '../utils/trackMetadata';
+import { getTrackTheme } from '../utils/trackThemes';
+import { formatTime } from '../utils/timeUtils';
+
+const createTrackId = () => Math.random().toString(36).slice(2, 11);
 
 export default function AudioMerger() {
   const [tracks, setTracks] = useState([]);
-  const [crossfade, setCrossfade] = useState(2); // Crossfade duration in seconds
-  const [mergeMode, setMergeMode] = useState('sequential'); // 'sequential' | 'mix'
+  const [crossfade, setCrossfade] = useState(2);
+  const [mergeMode, setMergeMode] = useState('sequential');
   const [isProcessing, setIsProcessing] = useState(false);
   const [mergedOutput, setMergedOutput] = useState(null);
   const [error, setError] = useState('');
   const [playingTrackId, setPlayingTrackId] = useState(null);
-  
+  const [previewPositions, setPreviewPositions] = useState({});
+  const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
+
   const fileInputRef = useRef(null);
-  const trackAudioRefs = useRef({});
+  const previewPlaybackRef = useRef(null);
+  const previewFrameRef = useRef(null);
+  const exportJobRef = useRef(0);
+  const exportMenuRef = useRef(null);
 
   const clearMergedOutput = () => {
     setMergedOutput((previousOutput) => {
       if (previousOutput) {
         URL.revokeObjectURL(previousOutput.wavUrl);
-        URL.revokeObjectURL(previousOutput.mp3Url);
+        if (previousOutput.mp3Url) {
+          URL.revokeObjectURL(previousOutput.mp3Url);
+        }
       }
 
       return null;
     });
   };
 
+  const stopPreviewPlayback = (resetTrackId = null) => {
+    if (previewFrameRef.current) {
+      cancelAnimationFrame(previewFrameRef.current);
+      previewFrameRef.current = null;
+    }
+
+    const activePreview = previewPlaybackRef.current;
+    if (activePreview?.source) {
+      try {
+        activePreview.source.onended = null;
+        activePreview.source.stop();
+      } catch {
+        // Ignore already-stopped sources.
+      }
+    }
+
+    if (activePreview?.audioCtx && activePreview.audioCtx.state !== 'closed') {
+      activePreview.audioCtx.close().catch(() => {});
+    }
+
+    previewPlaybackRef.current = null;
+    setPlayingTrackId(null);
+
+    if (resetTrackId) {
+      setPreviewPositions((previous) => ({
+        ...previous,
+        [resetTrackId]: null,
+      }));
+    }
+  };
+
   useEffect(() => {
     return () => {
-      Object.values(trackAudioRefs.current).forEach((sourceNode) => {
-        if (typeof sourceNode.stop === 'function') {
-          try {
-            sourceNode.stop();
-          } catch {
-            // Ignore already-stopped preview sources.
-          }
-        }
-      });
+      stopPreviewPlayback();
 
       if (mergedOutput) {
         URL.revokeObjectURL(mergedOutput.wavUrl);
-        URL.revokeObjectURL(mergedOutput.mp3Url);
+        if (mergedOutput.mp3Url) {
+          URL.revokeObjectURL(mergedOutput.mp3Url);
+        }
       }
     };
   }, [mergedOutput]);
 
-  // Initialize Audio Context just for decoding
-  const getAudioContext = () => {
-    return new (window.AudioContext || window.webkitAudioContext)();
-  };
+  useEffect(() => {
+    const handlePointerDown = (event) => {
+      if (!exportMenuRef.current?.contains(event.target)) {
+        setIsExportMenuOpen(false);
+      }
+    };
+
+    window.addEventListener('pointerdown', handlePointerDown);
+    return () => window.removeEventListener('pointerdown', handlePointerDown);
+  }, []);
 
   const handleFileUpload = async (event) => {
     const files = event.target.files;
@@ -58,328 +121,275 @@ export default function AudioMerger() {
     setIsProcessing(true);
     setError('');
 
+    let audioCtx;
+
     try {
-      const audioCtx = getAudioContext();
+      audioCtx = getAudioContext();
       const newTracks = [];
 
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
+      for (const file of files) {
+        const metadata = await extractTrackMetadata(file);
         const arrayBuffer = await file.arrayBuffer();
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-        
+
         newTracks.push({
-          id: Math.random().toString(36).substr(2, 9),
-          file: file,
+          id: createTrackId(),
+          file,
           name: file.name,
           buffer: audioBuffer,
+          displayTitle: metadata.title || file.name,
+          artist: metadata.artist,
+          album: metadata.album,
+          codec: metadata.codec,
+          bitrate: metadata.bitrate,
+          sampleRate: metadata.sampleRate,
+          artworkUrl: metadata.artworkUrl,
+          artworkFallbackUrls: metadata.artworkFallbackUrls,
+          waveformPeaks: buildWaveformPeaks(audioBuffer),
           duration: audioBuffer.duration,
           trimStart: 0,
           trimEnd: audioBuffer.duration,
           fadeIn: 0,
           fadeOut: 0,
+          zoom: 1,
         });
       }
 
-      setTracks(prev => [...prev, ...newTracks]);
-      // Reset merged output if we change tracks
-      clearMergedOutput(); 
-    } catch (err) {
-      console.error("Error decoding audio:", err);
-      setError("Failed to decode one or more audio files. Please ensure they are valid, supported audio formats.");
+      setTracks((previous) => [...previous, ...newTracks]);
+      clearMergedOutput();
+    } catch (uploadError) {
+      console.error('Error decoding audio:', uploadError);
+      setError('Failed to decode one or more audio files. Please ensure they are valid audio files.');
     } finally {
       setIsProcessing(false);
+      if (audioCtx && audioCtx.state !== 'closed') {
+        audioCtx.close().catch(() => {});
+      }
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
-  const normalizeTrackFades = (track) => {
-    const trimDuration = Math.max(0.01, track.trimEnd - track.trimStart);
-    let fadeIn = Math.max(0, Math.min(track.fadeIn ?? 0, trimDuration));
-    let fadeOut = Math.max(0, Math.min(track.fadeOut ?? 0, trimDuration));
-
-    if (fadeIn + fadeOut > trimDuration) {
-      const scale = trimDuration / (fadeIn + fadeOut);
-      fadeIn *= scale;
-      fadeOut *= scale;
-    }
-
-    return {
-      ...track,
-      fadeIn,
-      fadeOut,
-    };
-  };
-
   const updateTrackTrim = (id, type, value) => {
-    setTracks(tracks.map(track => {
-      if (track.id === id) {
-        let val = Number(value);
-        if (isNaN(val)) return track;
-        
-        // Clamp to valid boundaries (allow fine precision)
-        if (val < 0) val = 0;
-        if (val > track.duration) val = track.duration;
+    setTracks((previous) => previous.map((track) => {
+      if (track.id !== id) return track;
 
-        let newTrack = { ...track, [type]: val };
-        
-        // Ensure start is not after end and vice versa
-        if (type === 'trimStart' && newTrack.trimStart >= newTrack.trimEnd) {
-           newTrack.trimStart = Math.max(0, newTrack.trimEnd - 0.01);
-        }
-        if (type === 'trimEnd' && newTrack.trimEnd <= newTrack.trimStart) {
-           newTrack.trimEnd = Math.min(track.duration, newTrack.trimStart + 0.01);
-        }
-        return normalizeTrackFades(newTrack);
+      let nextValue = Number(value);
+      if (Number.isNaN(nextValue)) return track;
+
+      nextValue = Math.max(0, Math.min(track.duration, nextValue));
+      const nextTrack = { ...track, [type]: nextValue };
+
+      if (type === 'trimStart' && nextTrack.trimStart >= nextTrack.trimEnd) {
+        nextTrack.trimStart = Math.max(0, nextTrack.trimEnd - 0.01);
       }
-      return track;
+
+      if (type === 'trimEnd' && nextTrack.trimEnd <= nextTrack.trimStart) {
+        nextTrack.trimEnd = Math.min(track.duration, nextTrack.trimStart + 0.01);
+      }
+
+      return normalizeTrackFades(nextTrack);
     }));
+
     clearMergedOutput();
   };
 
   const updateTrackFade = (id, type, value) => {
-    setTracks(tracks.map(track => {
+    setTracks((previous) => previous.map((track) => {
       if (track.id !== id) return track;
 
       const fadeValue = Number(value);
-      if (isNaN(fadeValue)) return track;
+      if (Number.isNaN(fadeValue)) return track;
 
       return normalizeTrackFades({
         ...track,
         [type]: Math.max(0, fadeValue),
       });
     }));
+
     clearMergedOutput();
   };
 
+  const updateTrackZoom = (id, zoom) => {
+    setTracks((previous) => previous.map((track) => (
+      track.id === id ? { ...track, zoom } : track
+    )));
+  };
+
   const removeTrack = (id) => {
-    setTracks(tracks.filter(t => t.id !== id));
+    if (playingTrackId === id) {
+      stopPreviewPlayback(id);
+    }
+
+    setTracks((previous) => previous.filter((track) => track.id !== id));
     clearMergedOutput();
   };
 
   const duplicateTrack = (id) => {
-    const trackToCopy = tracks.find(t => t.id === id);
-    if (trackToCopy) {
-      const newTrack = { ...trackToCopy, id: Math.random().toString(36).substr(2, 9) };
-      const index = tracks.findIndex(t => t.id === id);
-      const newTracks = [...tracks];
-      newTracks.splice(index + 1, 0, newTrack); // Insert right after original
-      setTracks(newTracks);
-      clearMergedOutput();
-    }
+    setTracks((previous) => {
+      const index = previous.findIndex((track) => track.id === id);
+      if (index === -1) return previous;
+
+      const sourceTrack = previous[index];
+      const nextTrack = {
+        ...sourceTrack,
+        id: createTrackId(),
+      };
+
+      const nextTracks = [...previous];
+      nextTracks.splice(index + 1, 0, nextTrack);
+      return nextTracks;
+    });
+
+    clearMergedOutput();
   };
 
   const moveTrack = (index, direction) => {
-    if (direction === 'up' && index > 0) {
-      const newTracks = [...tracks];
-      [newTracks[index - 1], newTracks[index]] = [newTracks[index], newTracks[index - 1]];
-      setTracks(newTracks);
-      clearMergedOutput();
-    } else if (direction === 'down' && index < tracks.length - 1) {
-      const newTracks = [...tracks];
-      [newTracks[index + 1], newTracks[index]] = [newTracks[index], newTracks[index + 1]];
-      setTracks(newTracks);
-      clearMergedOutput();
-    }
-  };
+    setTracks((previous) => {
+      const nextTracks = [...previous];
 
-  // Utility to convert AudioBuffer to WAV Blob
-  const bufferToWav = (abuffer) => {
-    let numOfChan = abuffer.numberOfChannels,
-        length = abuffer.length * numOfChan * 2 + 44,
-        buffer = new ArrayBuffer(length),
-        view = new DataView(buffer),
-        channels = [], i, sample,
-        offset = 0,
-        pos = 0;
-
-    const setUint16 = (data) => {
-      view.setUint16(pos, data, true);
-      pos += 2;
-    };
-
-    const setUint32 = (data) => {
-      view.setUint32(pos, data, true);
-      pos += 4;
-    };
-
-    setUint32(0x46464952);                         // "RIFF"
-    setUint32(length - 8);                         // file length - 8
-    setUint32(0x45564157);                         // "WAVE"
-    setUint32(0x20746d66);                         // "fmt " chunk
-    setUint32(16);                                 // length = 16
-    setUint16(1);                                  // PCM (uncompressed)
-    setUint16(numOfChan);
-    setUint32(abuffer.sampleRate);
-    setUint32(abuffer.sampleRate * 2 * numOfChan); // avg. bytes/sec
-    setUint16(numOfChan * 2);                      // block-align
-    setUint16(16);                                 // 16-bit
-    setUint32(0x61746164);                         // "data" - chunk
-    setUint32(length - pos - 4);                   // chunk length
-
-    for(i = 0; i < abuffer.numberOfChannels; i++)
-      channels.push(abuffer.getChannelData(i));
-
-    while(offset < abuffer.length) {
-      for(i = 0; i < numOfChan; i++) {
-        sample = Math.max(-1, Math.min(1, channels[i][offset])); 
-        sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767)|0; 
-        view.setInt16(pos, sample, true);          
-        pos += 2;
+      if (direction === 'up' && index > 0) {
+        [nextTracks[index - 1], nextTracks[index]] = [nextTracks[index], nextTracks[index - 1]];
+      } else if (direction === 'down' && index < previous.length - 1) {
+        [nextTracks[index], nextTracks[index + 1]] = [nextTracks[index + 1], nextTracks[index]];
       }
-      offset++;
-    }
-    return new Blob([buffer], {type: "audio/wav"});
+
+      return nextTracks;
+    });
+
+    clearMergedOutput();
   };
 
-  const float32ToInt16 = (input) => {
-    const output = new Int16Array(input.length);
+  const getSequentialOverlap = (currentTrack, nextTrack) => {
+    if (!nextTrack || crossfade <= 0) return 0;
 
-    for (let index = 0; index < input.length; index++) {
-      const sample = Math.max(-1, Math.min(1, input[index]));
-      output[index] = sample < 0 ? sample * 32768 : sample * 32767;
-    }
+    const currentDuration = currentTrack.trimEnd - currentTrack.trimStart;
+    const nextDuration = nextTrack.trimEnd - nextTrack.trimStart;
 
-    return output;
+    return Math.max(0, Math.min(crossfade, currentDuration, nextDuration));
   };
 
-  const bufferToMp3 = (audioBuffer, kbps = 320) => {
-    const channels = Math.min(audioBuffer.numberOfChannels, 2);
-    const encoder = new lamejs.Mp3Encoder(channels, audioBuffer.sampleRate, kbps);
-    const leftChannel = float32ToInt16(audioBuffer.getChannelData(0));
-    const rightChannel = channels > 1
-      ? float32ToInt16(audioBuffer.getChannelData(1))
-      : null;
-    const blockSize = 1152;
-    const mp3Chunks = [];
+  const timelineSegments = useMemo(() => {
+    let currentTimeInTimeline = 0;
 
-    for (let index = 0; index < leftChannel.length; index += blockSize) {
-      const leftChunk = leftChannel.subarray(index, index + blockSize);
-      const mp3Buffer = channels > 1
-        ? encoder.encodeBuffer(leftChunk, rightChannel.subarray(index, index + blockSize))
-        : encoder.encodeBuffer(leftChunk);
+    return tracks.map((track, index) => {
+      const { safeTrimDuration } = getSafeTrackSegment(track);
+      const start = mergeMode === 'sequential' ? currentTimeInTimeline : 0;
+      const end = start + safeTrimDuration;
 
-      if (mp3Buffer.length > 0) {
-        mp3Chunks.push(new Int8Array(mp3Buffer));
+      if (mergeMode === 'sequential') {
+        currentTimeInTimeline = end - getSequentialOverlap(track, tracks[index + 1]);
       }
+
+      return {
+        id: track.id,
+        start,
+        end,
+        duration: safeTrimDuration,
+      };
+    });
+  }, [tracks, mergeMode, crossfade]);
+
+  const totalTimelineDuration = useMemo(() => {
+    if (timelineSegments.length === 0) return 0;
+    return timelineSegments.reduce((maxDuration, segment) => Math.max(maxDuration, segment.end), 0);
+  }, [timelineSegments]);
+
+  const globalPlayheadTime = useMemo(() => {
+    if (!playingTrackId) return null;
+
+    const activeTrack = tracks.find((track) => track.id === playingTrackId);
+    const activeSegment = timelineSegments.find((segment) => segment.id === playingTrackId);
+    const previewTime = previewPositions[playingTrackId];
+
+    if (!activeTrack || !activeSegment || previewTime == null) return null;
+
+    const offsetWithinTrack = Math.max(0, previewTime - activeTrack.trimStart);
+    return Math.min(totalTimelineDuration, activeSegment.start + offsetWithinTrack);
+  }, [playingTrackId, previewPositions, timelineSegments, totalTimelineDuration, tracks]);
+
+  const timelineTicks = useMemo(() => {
+    if (totalTimelineDuration <= 0) return [];
+
+    const preferredTickCount = 5;
+    const rawStep = totalTimelineDuration / preferredTickCount;
+
+    const normalizedStep = (() => {
+      if (rawStep <= 5) return 5;
+      if (rawStep <= 10) return 10;
+      if (rawStep <= 15) return 15;
+      if (rawStep <= 30) return 30;
+      if (rawStep <= 60) return 60;
+      if (rawStep <= 120) return 120;
+      return 300;
+    })();
+
+    const ticks = [];
+    for (let tick = 0; tick <= totalTimelineDuration + normalizedStep / 2; tick += normalizedStep) {
+      ticks.push(Number(tick.toFixed(3)));
     }
 
-    const finalChunk = encoder.flush();
-    if (finalChunk.length > 0) {
-      mp3Chunks.push(new Int8Array(finalChunk));
-    }
+    return ticks;
+  }, [totalTimelineDuration]);
 
-    return new Blob(mp3Chunks, { type: 'audio/mpeg' });
-  };
+  const downloadOutput = (format) => {
+    if (!mergedOutput) return;
 
-  const getTrackFadeDurations = (track, overlapWithPrevious = 0, overlapWithNext = 0) => {
-    const trimDuration = Math.max(0.01, track.trimEnd - track.trimStart);
-    let fadeInDuration = Math.max(track.fadeIn ?? 0, overlapWithPrevious);
-    let fadeOutDuration = Math.max(track.fadeOut ?? 0, overlapWithNext);
-
-    fadeInDuration = Math.min(fadeInDuration, trimDuration);
-    fadeOutDuration = Math.min(fadeOutDuration, trimDuration);
-
-    if (fadeInDuration + fadeOutDuration > trimDuration) {
-      const scale = trimDuration / (fadeInDuration + fadeOutDuration);
-      fadeInDuration *= scale;
-      fadeOutDuration *= scale;
-    }
-
-    return {
-      fadeInDuration,
-      fadeOutDuration,
-    };
-  };
-
-  const getSafeTrackSegment = (track) => {
-    const bufferDuration = track.buffer?.duration ?? track.duration ?? 0;
-    const safeTrimStart = Math.max(0, Math.min(track.trimStart, bufferDuration));
-    const safeTrimEnd = Math.max(safeTrimStart + 0.001, Math.min(track.trimEnd, bufferDuration));
-
-    return {
-      safeTrimStart,
-      safeTrimEnd,
-      safeTrimDuration: Math.max(0.001, safeTrimEnd - safeTrimStart),
-    };
-  };
-
-  const applyGainEnvelope = (gainNode, startTime, endTime, peakGain, fadeInDuration, fadeOutDuration) => {
-    gainNode.gain.cancelScheduledValues(startTime);
-
-    if (fadeInDuration > 0) {
-      gainNode.gain.setValueAtTime(0, startTime);
-      gainNode.gain.linearRampToValueAtTime(peakGain, startTime + fadeInDuration);
+    const link = document.createElement('a');
+    if (format === 'wav') {
+      link.href = mergedOutput.wavUrl;
+      link.download = 'merged_audio.wav';
+    } else if (format === 'mp3' && mergedOutput.mp3Url) {
+      link.href = mergedOutput.mp3Url;
+      link.download = 'merged_audio_320kbps.mp3';
     } else {
-      gainNode.gain.setValueAtTime(peakGain, startTime);
+      return;
     }
 
-    const fadeOutStart = Math.max(startTime + fadeInDuration, endTime - fadeOutDuration);
-    gainNode.gain.setValueAtTime(peakGain, fadeOutStart);
-
-    if (fadeOutDuration > 0) {
-      gainNode.gain.linearRampToValueAtTime(0, endTime);
-    } else {
-      gainNode.gain.setValueAtTime(peakGain, endTime);
-    }
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setIsExportMenuOpen(false);
   };
 
   const mergeTracks = async () => {
     if (tracks.length === 0) return;
-    
+
     setIsProcessing(true);
     setError('');
-    
+
+    let audioCtx;
+
     try {
-      // Calculate total required duration by simulating track positioning
+      const exportJobId = Date.now();
+      exportJobRef.current = exportJobId;
       let totalDuration = 0;
-      let currentTimeInCtx = 0;
+      let currentTimeInContext = 0;
 
-      const getSequentialOverlap = (currentTrack, nextTrack) => {
-        if (!nextTrack || crossfade <= 0) return 0;
-
-        const currentDuration = currentTrack.trimEnd - currentTrack.trimStart;
-        const nextDuration = nextTrack.trimEnd - nextTrack.trimStart;
-
-        return Math.max(0, Math.min(crossfade, currentDuration, nextDuration));
-      };
-      
       if (mergeMode === 'sequential') {
-        // First, calculate where all tracks will end up
-        for (let i = 0; i < tracks.length; i++) {
-          const { safeTrimDuration } = getSafeTrackSegment(tracks[i]);
-          const trimDur = safeTrimDuration;
-          const trackEndTime = currentTimeInCtx + trimDur;
+        for (let index = 0; index < tracks.length; index++) {
+          const { safeTrimDuration } = getSafeTrackSegment(tracks[index]);
+          const trackEndTime = currentTimeInContext + safeTrimDuration;
           totalDuration = trackEndTime;
 
-          const overlap = getSequentialOverlap(tracks[i], tracks[i + 1]);
-          currentTimeInCtx = trackEndTime - overlap;
+          const overlap = getSequentialOverlap(tracks[index], tracks[index + 1]);
+          currentTimeInContext = trackEndTime - overlap;
         }
       } else {
-        // Mix mode: all play at once, so total duration is the longest track
-        tracks.forEach(t => {
-          const { safeTrimDuration } = getSafeTrackSegment(t);
-          const dur = safeTrimDuration;
-          if (dur > totalDuration) totalDuration = dur;
+        tracks.forEach((track) => {
+          const { safeTrimDuration } = getSafeTrackSegment(track);
+          totalDuration = Math.max(totalDuration, safeTrimDuration);
         });
       }
-      
-      totalDuration = Math.max(0.1, totalDuration); // Ensure valid length
 
-      console.log('Merging tracks:');
-      console.log('Total calculated duration:', totalDuration.toFixed(2));
-      console.log('Merge mode:', mergeMode);
-      console.log('Crossfade duration:', crossfade);
-      
-      tracks.forEach((t, i) => {
-        const { safeTrimStart, safeTrimEnd, safeTrimDuration } = getSafeTrackSegment(t);
-        console.log(`Track ${i + 1}: ${safeTrimDuration.toFixed(2)}s (${formatTime(safeTrimStart)} - ${formatTime(safeTrimEnd)})`);
-      });
+      totalDuration = Math.max(0.1, totalDuration);
+      audioCtx = getAudioContext();
+      const offlineCtx = new OfflineAudioContext(
+        2,
+        Math.ceil(audioCtx.sampleRate * totalDuration),
+        audioCtx.sampleRate,
+      );
 
-      const audioCtx = getAudioContext();
-      const offlineCtx = new OfflineAudioContext(2, Math.ceil(audioCtx.sampleRate * totalDuration), audioCtx.sampleRate);
-
-      // Reset currentTimeInCtx for the track scheduling loop
-      currentTimeInCtx = 0;
+      currentTimeInContext = 0;
 
       tracks.forEach((track, index) => {
         const source = offlineCtx.createBufferSource();
@@ -389,16 +399,15 @@ export default function AudioMerger() {
         source.connect(gainNode);
         gainNode.connect(offlineCtx.destination);
 
-        const { safeTrimStart, safeTrimEnd, safeTrimDuration } = getSafeTrackSegment(track);
-        const trimDur = safeTrimDuration;
-        const startTimeInCtx = mergeMode === 'sequential' ? currentTimeInCtx : 0;
-        const endTimeInCtx = startTimeInCtx + trimDur;
-        const overlapWithPrevious =
-          mergeMode === 'sequential' && index > 0
-            ? getSequentialOverlap(tracks[index - 1], track)
-            : 0;
-        const overlapWithNext =
-          mergeMode === 'sequential' ? getSequentialOverlap(track, tracks[index + 1]) : 0;
+        const { safeTrimStart, safeTrimDuration } = getSafeTrackSegment(track);
+        const startTimeInContext = mergeMode === 'sequential' ? currentTimeInContext : 0;
+        const endTimeInContext = startTimeInContext + safeTrimDuration;
+        const overlapWithPrevious = mergeMode === 'sequential' && index > 0
+          ? getSequentialOverlap(tracks[index - 1], track)
+          : 0;
+        const overlapWithNext = mergeMode === 'sequential'
+          ? getSequentialOverlap(track, tracks[index + 1])
+          : 0;
         const { fadeInDuration, fadeOutDuration } = getTrackFadeDurations(
           track,
           overlapWithPrevious,
@@ -406,563 +415,489 @@ export default function AudioMerger() {
         );
         const peakGain = mergeMode === 'mix' ? 0.8 : 1;
 
-        console.log(`Scheduling track ${index + 1}: context time ${startTimeInCtx.toFixed(2)}s - ${endTimeInCtx.toFixed(2)}s (${trimDur.toFixed(2)}s), buffer offset ${safeTrimStart.toFixed(2)}s to ${safeTrimEnd.toFixed(2)}s`);
-
-        // Use proper start parameters: when, offset, duration
-        // This ensures we play ONLY the trimmed portion
-        source.start(startTimeInCtx, safeTrimStart, trimDur);
-
+        source.start(startTimeInContext, safeTrimStart, safeTrimDuration);
         applyGainEnvelope(
           gainNode,
-          startTimeInCtx,
-          endTimeInCtx,
+          startTimeInContext,
+          endTimeInContext,
           peakGain,
           fadeInDuration,
           fadeOutDuration,
         );
 
         if (mergeMode === 'sequential') {
-          currentTimeInCtx = endTimeInCtx - overlapWithNext;
+          currentTimeInContext = endTimeInContext - overlapWithNext;
         }
       });
 
       const renderedBuffer = await offlineCtx.startRendering();
       const wavBlob = bufferToWav(renderedBuffer);
-      const mp3Blob = bufferToMp3(renderedBuffer, 320);
       const wavUrl = URL.createObjectURL(wavBlob);
-      const mp3Url = URL.createObjectURL(mp3Blob);
 
       clearMergedOutput();
       setMergedOutput({
         wavUrl,
-        mp3Url,
+        mp3Url: null,
+        mp3Status: 'processing',
         previewUrl: wavUrl,
       });
-    } catch (err) {
-      console.error("Merging failed:", err);
-      const errorMessage = err instanceof Error ? err.message : String(err);
+
+      void createMp3BlobInWorker(renderedBuffer, 320)
+        .then((mp3Blob) => {
+          if (exportJobRef.current !== exportJobId) {
+            return;
+          }
+
+          const mp3Url = URL.createObjectURL(mp3Blob);
+          setMergedOutput((previousOutput) => {
+            if (!previousOutput || previousOutput.wavUrl !== wavUrl) {
+              URL.revokeObjectURL(mp3Url);
+              return previousOutput;
+            }
+
+            if (previousOutput.mp3Url) {
+              URL.revokeObjectURL(previousOutput.mp3Url);
+            }
+
+            return {
+              ...previousOutput,
+              mp3Url,
+              mp3Status: 'ready',
+            };
+          });
+        })
+        .catch((mp3Error) => {
+          console.error('MP3 export failed:', mp3Error);
+          if (exportJobRef.current !== exportJobId) {
+            return;
+          }
+
+          setMergedOutput((previousOutput) => {
+            if (!previousOutput || previousOutput.wavUrl !== wavUrl) {
+              return previousOutput;
+            }
+
+            return {
+              ...previousOutput,
+              mp3Status: 'failed',
+            };
+          });
+        });
+    } catch (mergeError) {
+      console.error('Merging failed:', mergeError);
+      const errorMessage = mergeError instanceof Error ? mergeError.message : String(mergeError);
       setError(`Failed to merge audio: ${errorMessage}`);
     } finally {
       setIsProcessing(false);
-    }
-  };
-
-  const formatTime = (seconds) => {
-    // Ensure we have a valid number
-    let totalSeconds = Number(seconds) || 0;
-    if (totalSeconds < 0) totalSeconds = 0;
-    
-    const hours = Math.floor(totalSeconds / 3600);
-    const remainingAfterHours = totalSeconds % 3600;
-    const mins = Math.floor(remainingAfterHours / 60);
-    const secs = Math.floor(remainingAfterHours % 60);
-    const centisecs = Math.floor((remainingAfterHours % 1) * 100);
-    
-    if (hours > 0) {
-      return `${hours}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-    }
-    return `${mins}:${secs.toString().padStart(2, '0')}.${centisecs.toString().padStart(2, '0')}`;
-  };
-
-  // Convert hh:mm:ss or mm:ss.cs to seconds
-  const parseTimeString = (timeStr, maxDuration) => {
-    try {
-      // Remove extra whitespace
-      const trimmed = timeStr.trim();
-      if (!trimmed) return 0;
-      
-      const parts = trimmed.split(':');
-      let seconds = 0;
-      
-      if (parts.length === 3) {
-        // hh:mm:ss format
-        const hours = parseInt(parts[0]) || 0;
-        const mins = parseInt(parts[1]) || 0;
-        const secs = parseFloat(parts[2]) || 0;
-        // Normalize: convert excess seconds to minutes, etc.
-        seconds = hours * 3600 + mins * 60 + secs;
-      } else if (parts.length === 2) {
-        // mm:ss.cs format
-        const mins = parseInt(parts[0]) || 0;
-        const secs = parseFloat(parts[1]) || 0;
-        // Normalize: convert excess seconds to minutes
-        seconds = mins * 60 + secs;
+      if (audioCtx && audioCtx.state !== 'closed') {
+        audioCtx.close().catch(() => {});
       }
-      
-      // Ensure valid range
-      return Math.max(0, Math.min(maxDuration, seconds));
-    } catch {
-      return 0;
     }
   };
 
-  // Play individual track
-  const playTrack = async (track) => {
+  const playTrack = async (track, startOffset = track.trimStart, toggleIfSame = true) => {
     try {
-      // Stop previous track if playing
-      if (playingTrackId && trackAudioRefs.current[playingTrackId]) {
-        try {
-          trackAudioRefs.current[playingTrackId].stop();
-        } catch {
-          // Ignore already-stopped preview sources.
-        }
-      }
-
-      if (playingTrackId === track.id) {
-        // Toggle off if same track
-        setPlayingTrackId(null);
+      if (playingTrackId === track.id && toggleIfSame) {
+        stopPreviewPlayback(track.id);
         return;
       }
 
+      stopPreviewPlayback();
+
       const audioCtx = getAudioContext();
-      
-      // Calculate trim duration
-      const trimDur = track.trimEnd - track.trimStart;
+      const previewStart = Math.max(track.trimStart, Math.min(track.trimEnd - 0.001, startOffset));
+      const trimDuration = Math.max(0.001, track.trimEnd - previewStart);
+      const originalTrimDuration = Math.max(0.001, track.trimEnd - track.trimStart);
+      const remainingRatio = trimDuration / originalTrimDuration;
+      const fadeInDuration = previewStart > track.trimStart ? 0 : Math.min(track.fadeIn ?? 0, trimDuration);
+      const fadeOutDuration = Math.min((track.fadeOut ?? 0) * remainingRatio, trimDuration);
+
       const gainNode = audioCtx.createGain();
-      const { fadeInDuration, fadeOutDuration } = getTrackFadeDurations(track, 0, 0);
-      
-      // Create buffer source for playback using Web Audio API
       const source = audioCtx.createBufferSource();
       source.buffer = track.buffer;
-      
-      // Connect to destination
       source.connect(gainNode);
       gainNode.connect(audioCtx.destination);
-      trackAudioRefs.current[track.id] = source;
-      
-      // Set playing state
+
       setPlayingTrackId(track.id);
-      
-      // Start playback from trim start position
+      setPreviewPositions((previous) => ({
+        ...previous,
+        [track.id]: previewStart,
+      }));
+
       const now = audioCtx.currentTime;
-      applyGainEnvelope(gainNode, now, now + trimDur, 1, fadeInDuration, fadeOutDuration);
-      source.start(now, track.trimStart, trimDur);
-      
-      // Stop after trim duration
-      source.stop(now + trimDur);
-      
-      // Reset when playback ends
-      source.onended = () => {
-        if (trackAudioRefs.current[track.id] === source) {
-          delete trackAudioRefs.current[track.id];
-        }
-        setPlayingTrackId(null);
+      applyGainEnvelope(gainNode, now, now + trimDuration, 1, fadeInDuration, fadeOutDuration);
+      source.start(now, previewStart, trimDuration);
+
+      previewPlaybackRef.current = {
+        trackId: track.id,
+        source,
+        audioCtx,
+        startedAt: now,
+        previewStart,
+        previewEnd: track.trimEnd,
       };
-    } catch (err) {
-      console.error("Error playing track:", err);
-      setError("Failed to play track");
+
+      const syncPreviewPosition = () => {
+        const activePreview = previewPlaybackRef.current;
+        if (!activePreview || activePreview.trackId !== track.id) return;
+
+        const elapsed = Math.max(0, activePreview.audioCtx.currentTime - activePreview.startedAt);
+        const currentTime = Math.min(activePreview.previewEnd, activePreview.previewStart + elapsed);
+
+        setPreviewPositions((previous) => ({
+          ...previous,
+          [track.id]: currentTime,
+        }));
+
+        if (currentTime < activePreview.previewEnd) {
+          previewFrameRef.current = requestAnimationFrame(syncPreviewPosition);
+        }
+      };
+
+      previewFrameRef.current = requestAnimationFrame(syncPreviewPosition);
+      source.stop(now + trimDuration);
+      source.onended = () => {
+        stopPreviewPlayback();
+        setPreviewPositions((previous) => ({
+          ...previous,
+          [track.id]: track.trimStart,
+        }));
+      };
+    } catch (playbackError) {
+      console.error('Error playing track:', playbackError);
+      setError('Failed to play track');
     }
   };
 
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 p-3 md:p-4 lg:p-8 font-sans">
-      <div className="max-w-6xl mx-auto space-y-4 md:space-y-6">
-        
-        {/* Header */}
-        <header className="flex items-center space-x-2 md:space-x-3 mb-4 md:mb-8">
-          <div className="p-2 md:p-3 bg-indigo-600 rounded-lg shrink-0">
-            <Music className="w-5 h-5 md:w-6 md:h-6 lg:w-8 lg:h-8 text-white" />
+    <div className="min-h-screen bg-[radial-gradient(circle_at_top,rgba(67,56,202,0.16),transparent_30%),linear-gradient(180deg,#060a16,#040814_55%,#030611)] p-3 font-sans text-slate-100 md:p-4 lg:p-5">
+      <div className="w-full rounded-[32px] border border-indigo-500/20 bg-[linear-gradient(180deg,rgba(4,8,20,0.96),rgba(4,8,18,0.98))] p-3 shadow-[0_30px_120px_rgba(2,6,23,0.85)] md:p-4">
+        <header className="mb-4 flex flex-col gap-3 rounded-[28px] border border-white/5 bg-[linear-gradient(180deg,rgba(10,15,33,0.98),rgba(5,9,22,0.98))] p-4 md:flex-row md:items-center md:justify-between">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="shrink-0 rounded-2xl bg-[linear-gradient(180deg,#6d4aff,#5630db)] p-3 shadow-[0_16px_32px_rgba(86,48,219,0.35)]">
+              <Music className="h-5 w-5 text-white md:h-6 md:w-6" />
+            </div>
+            <div className="min-w-0">
+              <h1 className="truncate text-xl font-semibold tracking-tight text-white md:text-2xl">AudioMerge Pro</h1>
+              <p className="truncate text-sm text-slate-400">Trim, fade, preview, and merge tracks locally in a browser-first editor.</p>
+            </div>
           </div>
-          <div className="min-w-0">
-            <h1 className="text-xl md:text-2xl lg:text-3xl font-bold text-white tracking-tight">AudioMerge Pro</h1>
-            <p className="text-slate-400 text-xs md:text-sm truncate">Trim, crossfade, and join your tracks locally.</p>
+
+          <div className="flex flex-col gap-3 md:flex-row md:items-center">
+            <div className="flex rounded-2xl border border-white/5 bg-slate-950/70 p-1">
+              <button
+                onClick={() => {
+                  setMergeMode('sequential');
+                  clearMergedOutput();
+                }}
+                className={`flex items-center gap-2 rounded-[14px] px-4 py-2 text-sm transition ${mergeMode === 'sequential' ? 'bg-[#6d4aff] text-white shadow-[0_10px_24px_rgba(109,74,255,0.35)]' : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'}`}
+              >
+                <List className="h-4 w-4" />
+                <span>Sequential</span>
+              </button>
+              <button
+                onClick={() => {
+                  setMergeMode('mix');
+                  clearMergedOutput();
+                }}
+                className={`flex items-center gap-2 rounded-[14px] px-4 py-2 text-sm transition ${mergeMode === 'mix' ? 'bg-[#6d4aff] text-white shadow-[0_10px_24px_rgba(109,74,255,0.35)]' : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'}`}
+              >
+                <Layers className="h-4 w-4" />
+                <span>Mix / Layer</span>
+              </button>
+            </div>
+
+            <div className="relative" ref={exportMenuRef}>
+              <button
+                type="button"
+                onClick={() => setIsExportMenuOpen((previous) => !previous)}
+                className="flex items-center gap-3 rounded-2xl border border-white/5 bg-slate-950/70 px-4 py-2.5 text-sm text-slate-200 transition hover:border-white/10 hover:bg-slate-900"
+              >
+                <Download className="h-4 w-4 text-slate-400" />
+                <span>Export</span>
+                <ChevronDown className={`h-4 w-4 text-slate-500 transition ${isExportMenuOpen ? 'rotate-180' : ''}`} />
+              </button>
+
+              {isExportMenuOpen && (
+                <div className="absolute right-0 top-[calc(100%+10px)] z-30 min-w-64 rounded-2xl border border-white/10 bg-[linear-gradient(180deg,rgba(11,16,34,0.98),rgba(7,12,24,0.98))] p-2 shadow-[0_24px_60px_rgba(2,6,23,0.72)]">
+                  <button
+                    type="button"
+                    onClick={() => downloadOutput('wav')}
+                    disabled={!mergedOutput}
+                    className="flex w-full items-center justify-between rounded-xl px-3 py-3 text-left transition hover:bg-white/[0.04] disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    <div>
+                      <div className="text-sm font-medium text-slate-100">Export WAV</div>
+                      <div className="text-xs text-slate-500">Lossless master output</div>
+                    </div>
+                    <span className="rounded-lg bg-emerald-500/15 px-2 py-1 text-[11px] font-medium text-emerald-300">Ready</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => downloadOutput('mp3')}
+                    disabled={!mergedOutput || mergedOutput.mp3Status !== 'ready' || !mergedOutput.mp3Url}
+                    className="flex w-full items-center justify-between rounded-xl px-3 py-3 text-left transition hover:bg-white/[0.04] disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    <div>
+                      <div className="text-sm font-medium text-slate-100">Export MP3</div>
+                      <div className="text-xs text-slate-500">320 kbps worker-encoded output</div>
+                    </div>
+                    <span className="rounded-lg bg-sky-500/15 px-2 py-1 text-[11px] font-medium text-sky-300">
+                      {!mergedOutput ? 'Locked' : mergedOutput.mp3Status === 'ready' ? 'Ready' : mergedOutput.mp3Status === 'processing' ? 'Processing' : 'Unavailable'}
+                    </span>
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </header>
 
-        {/* Error Alert */}
         {error && (
-          <div className="bg-red-500/20 border border-red-500/50 text-red-200 p-3 md:p-4 rounded-xl flex items-start gap-2 md:gap-3">
-            <Info className="w-5 h-5 flex-shrink-0 mt-0.5" />
+          <div className="flex items-start gap-2 rounded-xl border border-red-500/50 bg-red-500/20 p-3 text-red-200 md:gap-3 md:p-4">
+            <Info className="mt-0.5 h-5 w-5 shrink-0" />
             <p className="text-sm md:text-base">{error}</p>
           </div>
         )}
 
-        {/* Main Controls Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-6">
-          
-          {/* Settings Panel */}
-          <div className="lg:col-span-1 space-y-4 md:space-y-6">
-            <div className="bg-slate-800 p-4 md:p-6 rounded-2xl border border-slate-700 shadow-xl">
-              <h2 className="text-base md:text-lg font-semibold flex items-center space-x-2 mb-4">
-                <Sliders className="w-5 h-5 text-indigo-400 flex-shrink-0" />
-                <span>Global Settings</span>
-              </h2>
-              
-              <div className="space-y-5">
-                
-                {/* Merge Mode Toggle */}
-                <div>
-                  <label className="text-sm text-slate-400 font-medium mb-3 block">Merge Mode</label>
-                  <div className="flex bg-slate-900 rounded-xl p-1 border border-slate-700/50">
-                    <button
-                      onClick={() => { setMergeMode('sequential'); clearMergedOutput(); }}
-                      className={`flex-1 flex items-center justify-center space-x-2 py-2 px-3 rounded-lg text-sm transition-colors ${mergeMode === 'sequential' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'}`}
-                    >
-                      <List className="w-4 h-4" />
-                      <span>Sequential</span>
-                    </button>
-                    <button
-                      onClick={() => { setMergeMode('mix'); clearMergedOutput(); }}
-                      className={`flex-1 flex items-center justify-center space-x-2 py-2 px-3 rounded-lg text-sm transition-colors ${mergeMode === 'mix' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'}`}
-                    >
-                      <Layers className="w-4 h-4" />
-                      <span>Mix / Layer</span>
-                    </button>
-                  </div>
-                  <p className="text-xs text-slate-500 mt-2">
-                    {mergeMode === 'sequential' ? 'Plays tracks one after another (End-to-End).' : 'Plays all tracks simultaneously (Overlay).'}
-                  </p>
-                </div>
-
-                {mergeMode === 'sequential' && (
-                  <div className="pt-2 border-t border-slate-700/50">
-                    <div className="flex justify-between mb-2">
-                      <label className="text-sm text-slate-400 font-medium">Crossfade Duration</label>
-                      <span className="text-sm text-indigo-400 font-bold">{crossfade}s</span>
-                    </div>
-                    <input 
-                      type="range" 
-                      min="0" 
-                      max="10" 
-                      step="0.5" 
-                      value={crossfade}
-                      onChange={(e) => { setCrossfade(Number(e.target.value)); clearMergedOutput(); }}
-                      className="w-full accent-indigo-500"
-                    />
-                    <p className="text-xs text-slate-500 mt-2">
-                      Smooth overlap between tracks. Set to 0s for a hard cut.
-                    </p>
-                  </div>
-                )}
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-[260px_minmax(0,1fr)]">
+            <aside className="space-y-3 rounded-[28px] border border-white/5 bg-[linear-gradient(180deg,rgba(9,14,30,0.98),rgba(4,8,18,0.98))] p-3.5">
+              <div className="flex items-center justify-between">
+                <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-100">
+                <Scissors className="h-4 w-4 text-violet-300" />
+                <span>Track Sequence ({tracks.length})</span>
+                </h2>
               </div>
-            </div>
-
-            {/* Actions Panel */}
-            <div className="bg-slate-800 p-4 md:p-6 rounded-2xl border border-slate-700 shadow-xl">
-              <input 
-                type="file" 
-                ref={fileInputRef} 
-                onChange={handleFileUpload} 
-                accept="audio/*,.mp3,.wav,.ogg,.m4a,.aac,.flac,.wma,.aiff" 
-                multiple 
-                className="hidden" 
-              />
-              <button 
-                onClick={() => fileInputRef.current?.click()}
-                disabled={isProcessing}
-                className="w-full flex items-center justify-center space-x-2 bg-slate-700 hover:bg-slate-600 text-white p-3 rounded-xl transition-colors mb-4 disabled:opacity-50"
-              >
-                <Upload className="w-5 h-5" />
-                <span>Add Audio Files</span>
-              </button>
-
-              <button 
-                onClick={mergeTracks}
-                disabled={tracks.length === 0 || isProcessing}
-                className="w-full flex items-center justify-center space-x-2 bg-indigo-600 hover:bg-indigo-500 text-white p-3 rounded-xl transition-all shadow-lg shadow-indigo-600/30 disabled:opacity-50 disabled:shadow-none"
-              >
-                {isProcessing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Play className="w-5 h-5" />}
-                <span className="font-semibold">{isProcessing ? 'Processing...' : 'Merge Tracks'}</span>
-              </button>
-            </div>
-          </div>
-
-          {/* Track List Panel */}
-          <div className="lg:col-span-2 bg-slate-800 rounded-2xl border border-slate-700 p-4 md:p-6 shadow-xl min-h-[400px]">
-             <h2 className="text-base md:text-lg font-semibold flex items-center space-x-2 mb-4 md:mb-6">
-                <Scissors className="w-5 h-5 text-indigo-400 flex-shrink-0" />
-                <span className="truncate">Track Sequence ({tracks.length})</span>
-              </h2>
 
               {tracks.length === 0 ? (
-                <div className="flex flex-col items-center justify-center h-64 text-slate-500 border-2 border-dashed border-slate-700 rounded-xl">
-                  <Music className="w-12 h-12 mb-3 opacity-20" />
+                <div className="flex min-h-44 flex-col items-center justify-center rounded-2xl border border-dashed border-white/10 bg-white/[0.02] px-4 text-center text-slate-500">
+                  <Music className="mb-3 h-10 w-10 opacity-20" />
                   <p>No tracks added yet.</p>
-                  <p className="text-sm mt-1">Upload audio files to get started.</p>
+                  <p className="mt-1 text-xs">Upload audio files to build your sequence.</p>
                 </div>
               ) : (
-                <div className="space-y-3 md:space-y-4">
-                  {tracks.map((track, index) => (
-                    <div key={track.id} className="bg-slate-900 border border-slate-700 p-3 md:p-4 rounded-xl flex flex-col gap-4 relative overflow-visible group">
-                      
-                      {/* Connection Line */}
-                      {index < tracks.length - 1 && (
-                         <div className="hidden lg:block absolute -bottom-4 left-8 w-0.5 h-5 bg-indigo-500/30 z-0"></div>
-                      )}
-
-                      {/* Top Row: Reorder Controls + Title + Actions */}
-                      <div className="flex flex-row items-start justify-between gap-3 z-10">
-                        {/* Reorder Controls */}
-                        <div className="flex flex-row items-center gap-1 bg-slate-800 p-2 rounded-lg flex-shrink-0">
-                          <button 
-                            onClick={() => moveTrack(index, 'up')}
-                            disabled={index === 0}
-                            className="p-2 hover:bg-slate-700 rounded disabled:opacity-30 active:bg-slate-600 transition-colors"
-                            title="Move up"
+                <div className="space-y-2">
+                  {tracks.map((track, index) => {
+                    const theme = getTrackTheme(index);
+                    return (
+                      <div
+                        key={track.id}
+                        className="rounded-[18px] border border-white/5 bg-white/[0.02] p-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]"
+                      >
+                        <div className="flex items-center gap-2.5">
+                          <div className="relative h-11 w-11 shrink-0 overflow-hidden rounded-[14px] border border-white/10 bg-slate-900">
+                            {track.artworkUrl ? (
+                              <img src={track.artworkUrl} alt="" className="h-full w-full object-cover" />
+                            ) : (
+                              <div
+                                className="flex h-full w-full items-center justify-center"
+                                style={{ background: `linear-gradient(135deg, rgba(${theme.accent}, 0.28), rgba(${theme.accentDeep}, 0.55))` }}
+                              >
+                                <Music className="h-4 w-4 text-white" />
+                              </div>
+                            )}
+                          </div>
+                          <span
+                            className="inline-flex h-7 min-w-7 items-center justify-center rounded-[10px] px-2 text-xs font-semibold text-white"
+                            style={{ backgroundColor: `rgba(${theme.accent}, 0.82)` }}
                           >
-                            <MoveUp className="w-4 h-4 text-slate-300" />
-                          </button>
-                          <span className="text-xs font-bold text-slate-500 w-5 text-center px-1">{index + 1}</span>
-                          <button 
-                            onClick={() => moveTrack(index, 'down')}
-                            disabled={index === tracks.length - 1}
-                            className="p-2 hover:bg-slate-700 rounded disabled:opacity-30 active:bg-slate-600 transition-colors"
-                            title="Move down"
-                          >
-                            <MoveDown className="w-4 h-4 text-slate-300" />
-                          </button>
-                        </div>
-
-                        {/* Track Info */}
-                        <div className="flex-1 min-w-0">
-                          <h3 className="font-semibold text-slate-200 truncate text-sm md:text-base" title={track.name}>{track.name}</h3>
-                          <p className="text-xs text-slate-500">Duration: {formatTime(track.duration)}</p>
-                        </div>
-
-                        {/* Action Buttons */}
-                        <div className="flex items-center gap-1 flex-shrink-0">
-                          <button 
-                            onClick={() => playTrack(track)}
-                            title={playingTrackId === track.id ? "Stop playback" : "Play track"}
-                            className={`p-2 rounded transition-colors ${playingTrackId === track.id ? 'text-green-400 bg-slate-700' : 'text-slate-400 hover:text-green-400 hover:bg-slate-800'}`}
-                          >
-                            {playingTrackId === track.id ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
-                          </button>
-                          <button 
-                            onClick={() => duplicateTrack(track.id)}
-                            title="Duplicate track"
-                            className="p-2 text-slate-400 hover:text-indigo-400 hover:bg-slate-800 rounded transition-colors"
-                          >
-                            <Copy className="w-4 h-4" />
-                          </button>
-                          <button 
-                            onClick={() => removeTrack(track.id)}
-                            title="Remove track"
-                            className="p-2 text-slate-400 hover:text-red-400 hover:bg-slate-800 rounded transition-colors"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
-                      </div>
-
-                      {/* Trim Controls - Visual Crop Window */}
-                      <div className="flex flex-col space-y-3 bg-slate-800/50 p-3 md:p-4 rounded-lg border border-slate-700/50">
-                        
-                        {/* Timeline Visual */}
-                        <div className="space-y-2">
-                          <div className="flex justify-between items-center">
-                            <label className="text-xs text-slate-400 font-medium">Crop Window</label>
-                            <span className="text-xs text-indigo-400">
-                              {formatTime(track.trimEnd - track.trimStart)}
-                            </span>
-                          </div>
-                          
-                          {/* Visual Timeline Bar */}
-                          <div className="relative bg-slate-900 h-8 rounded-lg overflow-hidden border border-slate-600">
-                            {/* Total duration background */}
-                            <div className="absolute inset-0 bg-gradient-to-r from-slate-700 to-slate-800"></div>
-                            
-                            {/* Selected portion highlight */}
-                            <div 
-                              className="absolute h-full bg-gradient-to-r from-indigo-500 to-indigo-600 transition-all"
-                              style={{
-                                left: `${(track.trimStart / track.duration) * 100}%`,
-                                right: `${100 - (track.trimEnd / track.duration) * 100}%`,
-                              }}
-                            ></div>
-                            
-                            {/* Start handle */}
-                            <input 
-                              type="range" 
-                              min="0" 
-                              max={track.duration} 
-                              step="0.01" 
-                              value={track.trimStart}
-                              onChange={(e) => updateTrackTrim(track.id, 'trimStart', e.target.value)}
-                              className="absolute top-0 left-0 w-full h-full opacity-0 cursor-pointer z-10"
-                            />
-                            
-                            {/* End handle */}
-                            <input 
-                              type="range" 
-                              min="0" 
-                              max={track.duration} 
-                              step="0.01" 
-                              value={track.trimEnd}
-                              onChange={(e) => updateTrackTrim(track.id, 'trimEnd', e.target.value)}
-                              className="absolute top-0 left-0 w-full h-full opacity-0 cursor-pointer z-10 [direction:rtl]"
-                            />
-                            
-                            {/* Visual handles */}
-                            <div 
-                              className="absolute top-1/2 -translate-y-1/2 w-0.5 h-6 bg-emerald-400 cursor-col-resize pointer-events-none"
-                              style={{left: `${(track.trimStart / track.duration) * 100}%`}}
-                            ></div>
-                            <div 
-                              className="absolute top-1/2 -translate-y-1/2 w-0.5 h-6 bg-rose-400 cursor-col-resize pointer-events-none"
-                              style={{right: `${(1 - track.trimEnd / track.duration) * 100}%`}}
-                            ></div>
-                          </div>
-                          
-                          {/* Time labels */}
-                          <div className="flex justify-between text-xs text-slate-500">
-                            <span>{formatTime(0)}</span>
-                            <span>{formatTime(track.duration)}</span>
-                          </div>
-                        </div>
-
-                        {/* Time Input Fields */}
-                        <div className="grid grid-cols-2 gap-2">
-                          <div className="flex flex-col space-y-1">
-                            <label className="text-xs text-slate-400 font-medium">Start (↑↓ adjust)</label>
-                            <input 
-                              type="text" 
-                              placeholder="mm:ss.cs"
-                              value={formatTime(track.trimStart)}
-                              onChange={(e) => updateTrackTrim(track.id, 'trimStart', parseTimeString(e.target.value, track.duration))}
-                              onKeyDown={(e) => {
-                                if (e.key === 'ArrowUp') {
-                                  e.preventDefault();
-                                  updateTrackTrim(track.id, 'trimStart', Math.min(track.duration - 0.01, track.trimStart + 0.1));
-                                } else if (e.key === 'ArrowDown') {
-                                  e.preventDefault();
-                                  updateTrackTrim(track.id, 'trimStart', Math.max(0, track.trimStart - 0.1));
-                                }
-                              }}
-                              className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs font-mono text-slate-200 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition-all"
-                            />
-                          </div>
-                          <div className="flex flex-col space-y-1">
-                            <label className="text-xs text-slate-400 font-medium">End (↑↓ adjust)</label>
-                            <input 
-                              type="text" 
-                              placeholder="mm:ss.cs"
-                              value={formatTime(track.trimEnd)}
-                              onChange={(e) => updateTrackTrim(track.id, 'trimEnd', parseTimeString(e.target.value, track.duration))}
-                              onKeyDown={(e) => {
-                                if (e.key === 'ArrowUp') {
-                                  e.preventDefault();
-                                  updateTrackTrim(track.id, 'trimEnd', Math.min(track.duration, track.trimEnd + 0.1));
-                                } else if (e.key === 'ArrowDown') {
-                                  e.preventDefault();
-                                  updateTrackTrim(track.id, 'trimEnd', Math.max(0.01, track.trimEnd - 0.1));
-                                }
-                              }}
-                              className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs font-mono text-slate-200 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500 transition-all"
-                            />
-                          </div>
-                        </div>
-
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2 border-t border-slate-700/50">
-                          <div className="flex flex-col space-y-2">
-                            <div className="flex items-center justify-between">
-                              <label className="text-xs text-slate-400 font-medium">Fade In</label>
-                              <span className="text-xs text-emerald-400">{formatTime(track.fadeIn ?? 0)}</span>
-                            </div>
-                            <input
-                              type="range"
-                              min="0"
-                              max={Math.max(0.01, track.trimEnd - track.trimStart)}
-                              step="0.01"
-                              value={track.fadeIn ?? 0}
-                              onChange={(e) => updateTrackFade(track.id, 'fadeIn', e.target.value)}
-                              className="w-full accent-emerald-500"
-                            />
-                            <input
-                              type="text"
-                              placeholder="0:00.00"
-                              value={formatTime(track.fadeIn ?? 0)}
-                              onChange={(e) => updateTrackFade(track.id, 'fadeIn', parseTimeString(e.target.value, track.trimEnd - track.trimStart))}
-                              onKeyDown={(e) => {
-                                if (e.key === 'ArrowUp') {
-                                  e.preventDefault();
-                                  updateTrackFade(track.id, 'fadeIn', (track.fadeIn ?? 0) + 0.1);
-                                } else if (e.key === 'ArrowDown') {
-                                  e.preventDefault();
-                                  updateTrackFade(track.id, 'fadeIn', Math.max(0, (track.fadeIn ?? 0) - 0.1));
-                                }
-                              }}
-                              className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs font-mono text-slate-200 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition-all"
-                            />
-                          </div>
-                          <div className="flex flex-col space-y-2">
-                            <div className="flex items-center justify-between">
-                              <label className="text-xs text-slate-400 font-medium">Fade Out</label>
-                              <span className="text-xs text-rose-400">{formatTime(track.fadeOut ?? 0)}</span>
-                            </div>
-                            <input
-                              type="range"
-                              min="0"
-                              max={Math.max(0.01, track.trimEnd - track.trimStart)}
-                              step="0.01"
-                              value={track.fadeOut ?? 0}
-                              onChange={(e) => updateTrackFade(track.id, 'fadeOut', e.target.value)}
-                              className="w-full accent-rose-500"
-                            />
-                            <input
-                              type="text"
-                              placeholder="0:00.00"
-                              value={formatTime(track.fadeOut ?? 0)}
-                              onChange={(e) => updateTrackFade(track.id, 'fadeOut', parseTimeString(e.target.value, track.trimEnd - track.trimStart))}
-                              onKeyDown={(e) => {
-                                if (e.key === 'ArrowUp') {
-                                  e.preventDefault();
-                                  updateTrackFade(track.id, 'fadeOut', (track.fadeOut ?? 0) + 0.1);
-                                } else if (e.key === 'ArrowDown') {
-                                  e.preventDefault();
-                                  updateTrackFade(track.id, 'fadeOut', Math.max(0, (track.fadeOut ?? 0) - 0.1));
-                                }
-                              }}
-                              className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs font-mono text-slate-200 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500 transition-all"
-                            />
+                            {index + 1}
+                          </span>
+                          <div className="min-w-0 flex-1">
+                            <p className="truncate text-[13px] font-medium text-slate-100">{track.displayTitle || track.name}</p>
+                            <p className="mt-0.5 truncate text-[11px] text-slate-500">{formatTime(track.duration)}</p>
                           </div>
                         </div>
                       </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              <div className="space-y-2 rounded-[20px] border border-white/5 bg-white/[0.02] p-2.5">
+                <input
+                  type="file"
+                  ref={fileInputRef}
+                  onChange={handleFileUpload}
+                  accept="audio/*,.mp3,.wav,.ogg,.m4a,.aac,.flac,.wma,.aiff"
+                  multiple
+                  className="hidden"
+                />
+                <button
+                  onClick={() => {
+                    preloadTrackMetadataParser();
+                    fileInputRef.current?.click();
+                  }}
+                  disabled={isProcessing}
+                  className="flex w-full items-center justify-center gap-2 rounded-[16px] border border-white/5 bg-[linear-gradient(180deg,rgba(32,41,64,0.92),rgba(18,24,40,0.98))] px-3 py-3 text-sm text-white transition hover:brightness-110 disabled:opacity-50"
+                >
+                  <Upload className="h-4 w-4" />
+                  <span>Add Audio Files</span>
+                </button>
+
+                <button
+                  onClick={mergeTracks}
+                  disabled={tracks.length === 0 || isProcessing}
+                  className="flex w-full items-center justify-center gap-2 rounded-[16px] bg-[linear-gradient(180deg,#6d4aff,#5630db)] px-3 py-3 text-sm text-white shadow-[0_18px_40px_rgba(86,48,219,0.32)] transition hover:brightness-110 disabled:opacity-50 disabled:shadow-none"
+                >
+                  {isProcessing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+                  <span className="font-semibold">{isProcessing ? 'Processing...' : 'Merge Tracks'}</span>
+                </button>
+              </div>
+
+              <div className="space-y-2 rounded-[20px] border border-white/5 bg-white/[0.02] p-2.5">
+                {mergeMode === 'sequential' && (
+                  <div>
+                    <div className="mb-2 flex items-center justify-between">
+                      <label className="text-xs font-medium text-slate-300">Crossfade</label>
+                      <span className="text-xs font-semibold text-violet-300">{crossfade.toFixed(1)}s</span>
                     </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="10"
+                      step="0.5"
+                      value={crossfade}
+                      onChange={(event) => {
+                        setCrossfade(Number(event.target.value));
+                        clearMergedOutput();
+                      }}
+                      className="w-full"
+                      style={{ accentColor: '#6d4aff' }}
+                    />
+                  </div>
+                )}
+                <div className="rounded-[16px] border border-white/5 bg-slate-950/55 p-3 text-[11px] text-slate-400">
+                  {mergeMode === 'sequential'
+                    ? 'Tracks play one after another with optional crossfades.'
+                    : 'Tracks start together for layered mixes.'}
+                </div>
+              </div>
+            </aside>
+
+            <section className="rounded-[28px] border border-white/5 bg-[linear-gradient(180deg,rgba(9,14,30,0.98),rgba(4,8,18,0.98))] p-4 md:p-5">
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-white/5 bg-white/[0.02] px-4 py-3">
+              <div>
+                <h2 className="text-lg font-semibold text-slate-100">Timeline Editor</h2>
+                <p className="text-sm text-slate-500">Album art, waveform lanes, trim windows, and fade envelopes are aligned in one editing stage.</p>
+              </div>
+              <div className="flex items-center gap-3 text-xs text-slate-400">
+                <div className="rounded-xl border border-white/5 bg-slate-950/60 px-3 py-2">Mode: {mergeMode === 'sequential' ? 'Sequential' : 'Mix / Layer'}</div>
+                <div className="rounded-xl border border-white/5 bg-slate-950/60 px-3 py-2">Tracks: {tracks.length}</div>
+              </div>
+              </div>
+
+              <div className="mb-4 rounded-[24px] border border-white/5 bg-[linear-gradient(180deg,rgba(10,16,33,0.98),rgba(5,10,20,0.98))] p-4">
+                <div className="mb-3 flex items-center justify-between text-[11px] uppercase tracking-[0.18em] text-slate-500">
+                  <span>Global Timeline</span>
+                  <span>{totalTimelineDuration > 0 ? formatTime(totalTimelineDuration) : '00:00'}</span>
+                </div>
+                <div className="relative h-16 overflow-hidden rounded-2xl border border-white/5 bg-[linear-gradient(180deg,rgba(6,10,20,0.92),rgba(4,7,16,0.98))]">
+                  <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(255,255,255,0.02)_1px,transparent_1px)] bg-[length:96px_100%] opacity-35" />
+                  {timelineTicks.map((tick) => {
+                    const left = totalTimelineDuration > 0 ? (tick / totalTimelineDuration) * 100 : 0;
+                    return (
+                      <div key={tick} className="absolute inset-y-0" style={{ left: `${left}%` }}>
+                        <div className="h-full w-px bg-white/10" />
+                        <span className="absolute left-1/2 top-2 -translate-x-1/2 whitespace-nowrap text-[11px] text-slate-400">
+                          {formatTime(tick)}
+                        </span>
+                      </div>
+                    );
+                  })}
+                  {timelineSegments.map((segment, index) => {
+                    const left = totalTimelineDuration > 0 ? (segment.start / totalTimelineDuration) * 100 : 0;
+                    const width = totalTimelineDuration > 0 ? ((segment.end - segment.start) / totalTimelineDuration) * 100 : 0;
+                    const theme = getTrackTheme(index);
+                    return (
+                      <div
+                        key={segment.id}
+                        className="absolute bottom-3 top-8 rounded-xl border"
+                        style={{
+                          left: `${left}%`,
+                          width: `${Math.max(width, 2)}%`,
+                          background: `linear-gradient(180deg, rgba(${theme.accent}, 0.22), rgba(${theme.accentDeep}, 0.12))`,
+                          borderColor: `rgba(${theme.accentSoft}, 0.26)`,
+                          boxShadow: `0 10px 24px rgba(${theme.glow}, 0.12)`,
+                        }}
+                      />
+                    );
+                  })}
+                  {globalPlayheadTime != null && totalTimelineDuration > 0 && (
+                    <div
+                      className="absolute inset-y-0 z-20 w-px bg-white/90 shadow-[0_0_14px_rgba(255,255,255,0.45)]"
+                      style={{ left: `${(globalPlayheadTime / totalTimelineDuration) * 100}%` }}
+                    >
+                      <div className="absolute left-1/2 top-0 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border border-violet-200/80 bg-violet-300 shadow-[0_0_16px_rgba(196,181,253,0.85)]" />
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {tracks.length === 0 ? (
+                <div className="flex min-h-[420px] flex-col items-center justify-center rounded-[24px] border border-dashed border-white/10 bg-[linear-gradient(180deg,rgba(15,23,42,0.5),rgba(2,6,23,0.7))] text-center text-slate-500">
+                  <Music className="mb-3 h-14 w-14 opacity-20" />
+                  <p className="text-lg text-slate-400">Timeline is empty</p>
+                  <p className="mt-1 text-sm">Add tracks from the sidebar to start shaping the arrangement.</p>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  {tracks.map((track, index) => (
+                    <TrackCard
+                      key={track.id}
+                      track={track}
+                      index={index}
+                      totalTracks={tracks.length}
+                      isPlaying={playingTrackId === track.id}
+                      previewPosition={previewPositions[track.id] ?? track.trimStart}
+                      onMove={moveTrack}
+                      onPlay={playTrack}
+                      onDuplicate={duplicateTrack}
+                      onRemove={removeTrack}
+                      onTrimChange={updateTrackTrim}
+                      onFadeChange={updateTrackFade}
+                      onZoomChange={updateTrackZoom}
+                    />
                   ))}
                 </div>
               )}
+            </section>
           </div>
         </div>
 
-        {/* Result Area */}
         {mergedOutput && (
-          <div className="bg-gradient-to-r from-indigo-900/50 to-purple-900/50 border border-indigo-500/30 p-4 md:p-6 rounded-2xl shadow-xl animate-in fade-in slide-in-from-bottom-4">
-            <h2 className="text-lg md:text-xl font-bold text-white mb-4 flex items-center space-x-2">
-              <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse flex-shrink-0"></div>
-              <span>Merged Audio Ready</span>
-            </h2>
-            <p className="text-xs md:text-sm text-slate-300 mb-4">
-              WAV is lossless. MP3 is exported at 320 kbps, which is high quality but not lossless.
-            </p>
-            <div className="flex flex-col gap-3 md:gap-4">
-              <audio 
-                controls 
-                src={mergedOutput.previewUrl} 
-                className="w-full h-10 md:h-12 rounded-lg"
-              />
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <a 
-                  href={mergedOutput.wavUrl} 
-                  download="merged_audio.wav"
-                  className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white px-4 md:px-6 py-2 md:py-3 rounded-xl transition-colors shadow-lg shadow-emerald-600/20 font-semibold text-sm md:text-base"
-                >
-                  <Download className="w-4 h-4 md:w-5 md:h-5" />
-                  <span>Download WAV</span>
-                </a>
-                <a 
-                  href={mergedOutput.mp3Url} 
-                  download="merged_audio_320kbps.mp3"
-                  className="w-full flex items-center justify-center gap-2 bg-sky-600 hover:bg-sky-500 text-white px-4 md:px-6 py-2 md:py-3 rounded-xl transition-colors shadow-lg shadow-sky-600/20 font-semibold text-sm md:text-base"
-                >
-                  <Download className="w-4 h-4 md:w-5 md:h-5" />
-                  <span>Download MP3 (320 kbps)</span>
-                </a>
+          <div className="animate-in slide-in-from-bottom-4 mt-4 rounded-[24px] border border-indigo-500/25 bg-[linear-gradient(180deg,rgba(30,27,75,0.34),rgba(49,46,129,0.16))] p-4 shadow-xl fade-in md:p-5">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <h2 className="flex items-center gap-2 text-base font-semibold text-white md:text-lg">
+                  <div className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-green-400" />
+                  <span>Output Preview Ready</span>
+                </h2>
+                <p className="mt-1 text-xs text-slate-300 md:text-sm">
+                  Use the export dropdown in the header for files. This panel stays focused on playback and status.
+                </p>
+              </div>
+              <div className="flex items-center gap-2 text-xs text-slate-400">
+                <span className="rounded-xl border border-white/5 bg-slate-950/50 px-3 py-2">WAV ready</span>
+                <span className="rounded-xl border border-white/5 bg-slate-950/50 px-3 py-2">
+                  {mergedOutput.mp3Status === 'ready' ? 'MP3 ready' : mergedOutput.mp3Status === 'processing' ? 'MP3 processing' : 'MP3 failed'}
+                </span>
               </div>
             </div>
+            <audio controls src={mergedOutput.previewUrl} className="mt-4 h-10 w-full rounded-lg md:h-12" />
           </div>
         )}
 
+        {tracks.length > 0 && (
+          <div className="mt-4 rounded-[24px] border border-white/5 bg-slate-950/50 p-4 text-sm text-slate-400">
+            <p>
+              Ruler ticks follow the current zoom level. Drag the white trim handles, drag the highlighted selection to reposition it, or click anywhere on the waveform to preview from that exact point.
+            </p>
+            <p className="mt-2 text-xs text-slate-500">
+              Current session: {tracks.length} track{tracks.length === 1 ? '' : 's'} loaded, merge mode {mergeMode}, crossfade {formatTime(crossfade)}.
+            </p>
+          </div>
+        )}
       </div>
     </div>
   );
