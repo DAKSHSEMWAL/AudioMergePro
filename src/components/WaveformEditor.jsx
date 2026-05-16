@@ -131,6 +131,7 @@ const WaveformEditor = ({
   const accentRamp = `rgba(${theme.accentDeep}, 0.22)`;
   const accentLabel = `rgba(${theme.accentSoft}, 0.92)`;
   const accentLine = `rgba(${theme.accent}, 0.95)`;
+  const selectionClipPath = `inset(0 ${rightPercent}% 0 ${leftPercent}%)`;
 
   useEffect(() => {
     return () => {
@@ -278,6 +279,45 @@ const WaveformEditor = ({
           <div className="absolute inset-y-0 left-0 bg-slate-950/65" style={{ width: `${leftPercent}%` }} />
           <div className="absolute inset-y-0 right-0 bg-slate-950/65" style={{ width: `${rightPercent}%` }} />
 
+          <svg
+            viewBox={`0 0 ${WAVEFORM_VIEWBOX_WIDTH} 100`}
+            preserveAspectRatio="none"
+            className="pointer-events-none absolute inset-0 z-10 h-full w-full"
+            style={{ clipPath: selectionClipPath }}
+            aria-hidden="true"
+          >
+            {(track.fadeIn ?? 0) > 0 && (
+              <>
+                <path
+                  d={buildFadeEnvelopeFillPath('in')}
+                  fill="rgba(3, 15, 23, 0.64)"
+                />
+                <path
+                  d={buildFadeEnvelopePath('in')}
+                  fill="none"
+                  stroke={accentLine}
+                  strokeWidth="2.2"
+                  strokeLinecap="round"
+                />
+              </>
+            )}
+            {(track.fadeOut ?? 0) > 0 && (
+              <>
+                <path
+                  d={buildFadeEnvelopeFillPath('out')}
+                  fill="rgba(3, 15, 23, 0.64)"
+                />
+                <path
+                  d={buildFadeEnvelopePath('out')}
+                  fill="none"
+                  stroke={accentLine}
+                  strokeWidth="2.2"
+                  strokeLinecap="round"
+                />
+              </>
+            )}
+          </svg>
+
           <div
             className="absolute inset-y-1 overflow-hidden rounded-[18px] border border-cyan-300/45 bg-cyan-400/8 shadow-[0_0_0_1px_rgba(34,211,238,0.08),0_0_22px_rgba(34,211,238,0.12)]"
             style={{
@@ -305,36 +345,6 @@ const WaveformEditor = ({
                 strokeWidth="1.4"
                 strokeLinejoin="round"
               />
-              {(track.fadeIn ?? 0) > 0 && (
-                <>
-                  <path
-                    d={buildFadeEnvelopeFillPath('in')}
-                    fill="rgba(3, 15, 23, 0.64)"
-                  />
-                  <path
-                    d={buildFadeEnvelopePath('in')}
-                    fill="none"
-                    stroke={accentLine}
-                    strokeWidth="2.2"
-                    strokeLinecap="round"
-                  />
-                </>
-              )}
-              {(track.fadeOut ?? 0) > 0 && (
-                <>
-                  <path
-                    d={buildFadeEnvelopeFillPath('out')}
-                    fill="rgba(3, 15, 23, 0.64)"
-                  />
-                  <path
-                    d={buildFadeEnvelopePath('out')}
-                    fill="none"
-                    stroke={accentLine}
-                    strokeWidth="2.2"
-                    strokeLinecap="round"
-                  />
-                </>
-              )}
             </svg>
           </div>
 

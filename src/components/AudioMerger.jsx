@@ -45,6 +45,7 @@ export default function AudioMerger() {
   const previewFrameRef = useRef(null);
   const exportJobRef = useRef(0);
   const exportMenuRef = useRef(null);
+  const mergedOutputRef = useRef(null);
 
   const clearMergedOutput = () => {
     setMergedOutput((previousOutput) => {
@@ -91,17 +92,21 @@ export default function AudioMerger() {
   };
 
   useEffect(() => {
+    mergedOutputRef.current = mergedOutput;
+  }, [mergedOutput]);
+
+  useEffect(() => {
     return () => {
       stopPreviewPlayback();
 
-      if (mergedOutput) {
-        URL.revokeObjectURL(mergedOutput.wavUrl);
-        if (mergedOutput.mp3Url) {
-          URL.revokeObjectURL(mergedOutput.mp3Url);
+      if (mergedOutputRef.current) {
+        URL.revokeObjectURL(mergedOutputRef.current.wavUrl);
+        if (mergedOutputRef.current.mp3Url) {
+          URL.revokeObjectURL(mergedOutputRef.current.mp3Url);
         }
       }
     };
-  }, [mergedOutput]);
+  }, []);
 
   useEffect(() => {
     const handlePointerDown = (event) => {
@@ -173,6 +178,7 @@ export default function AudioMerger() {
     setTracks((previous) => previous.map((track) => {
       if (track.id !== id) return track;
 
+      const previousTrimDuration = Math.max(0.01, track.trimEnd - track.trimStart);
       let nextValue = Number(value);
       if (Number.isNaN(nextValue)) return track;
 
@@ -185,6 +191,14 @@ export default function AudioMerger() {
 
       if (type === 'trimEnd' && nextTrack.trimEnd <= nextTrack.trimStart) {
         nextTrack.trimEnd = Math.min(track.duration, nextTrack.trimStart + 0.01);
+      }
+
+      const nextTrimDuration = Math.max(0.01, nextTrack.trimEnd - nextTrack.trimStart);
+
+      if (nextTrimDuration < previousTrimDuration) {
+        const trimRatio = nextTrimDuration / previousTrimDuration;
+        nextTrack.fadeIn = (track.fadeIn ?? 0) * trimRatio;
+        nextTrack.fadeOut = (track.fadeOut ?? 0) * trimRatio;
       }
 
       return normalizeTrackFades(nextTrack);
